@@ -440,38 +440,72 @@ print(IPRE.sub("[已隐去]", txt))
 # 看回程经过哪家骨干，就知道是 CN2 GIA 还是普通 163。
 route_name_of_asn() {
   case "$1" in
-    4809)  echo "CN2 GIA" ;;
-    4812)  echo "CN2 GT" ;;
-    4134)  echo "163 骨干" ;;
-    9929)  echo "联通 9929" ;;
-    4837)  echo "联通 4837" ;;
-    4808)  echo "联通 4808" ;;
+    4809)  echo "CN2" ;;
+    9929)  echo "联通 9929 (CUII)" ;;
     58807) echo "移动 CMIN2" ;;
+    4134)  echo "163 骨干" ;;
+    4837)  echo "联通 169" ;;
     58453) echo "移动 CMI" ;;
-    9808)  echo "移动 9808" ;;
-    56048) echo "移动 56048" ;;
-    10099) echo "移动 10099" ;;
+    4812)  echo "中国电信" ;;
+    4808)  echo "中国联通" ;;
+    9808)  echo "中国移动" ;;
+    56040) echo "中国移动" ;;
+    10099) echo "中国移动" ;;
     *)     echo "" ;;
   esac
 }
 
-# 优先级：数字越小越"高级"。路径上同时出现多个时取最好的那个 ——
-# 一条走了 4809 的线路，不该因为中间蹭了一下 4134 就被判成 163。
-route_rank() {
-  case "$1" in
-    4809) echo 1 ;;  # CN2 GIA
-    9929) echo 2 ;;  # 联通 9929
-    58807) echo 3 ;; # 移动 CMIN2
-    58453) echo 4 ;; # 移动 CMI
-    4812) echo 5 ;;  # CN2 GT
-    4837) echo 6 ;;  # 联通 4837
-    4808) echo 7 ;;
-    9808) echo 8 ;;
-    56048) echo 9 ;;
-    10099) echo 10 ;;
-    4134) echo 11 ;; # 163 骨干（普通）
-    *) echo 99 ;;
-  esac
+# ⚠️ **CN2 GIA 和 CN2 GT 共用 AS4809**，靠单个 ASN 分不出来。
+# 区别在"国内段走什么"：
+#   GIA = 全程 AS4809（国内段也是 CN2，贵、稳）
+#   GT  = 国际段 AS4809，国内段走 163(AS4134)（便宜、高峰期会堵）
+# 所以判据是**整条路径的 ASN 集合**，不是某一个值。
+#
+# 另外：AS4812/4808 这类是"中国电信/中国联通"的普通 ASN，
+# **不是 CN2**。之前把它们标成 "CN2 GT" 是错的 —— 会被误读成好线路。
+route_classify() {
+  python3 -c '
+import json,sys
+PREMIUM_4809 = "CN2"
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(json.dumps({"line":"","quality":"","asns":[]}, ensure_ascii=False)); raise SystemExit
+
+asns = []
+for hop in (d.get("Hops") or []):
+    for p in (hop if isinstance(hop, list) else [hop]):
+        if not isinstance(p, dict):
+            continue
+        a = str((p.get("Geo") or {}).get("asnumber") or "").strip()
+        if a.isdigit() and a not in asns:
+            asns.append(a)
+S = set(asns)
+
+# 精品线路：出现这些才算
+if "4809" in S:
+    # GT 的国内段走 163；全程 4809 才是 GIA
+    line, quality = ("CN2 GT", "普通") if "4134" in S else ("CN2 GIA", "精品")
+elif "9929" in S:
+    line, quality = "联通 9929 (CUII)", "精品"
+elif "58807" in S:
+    line, quality = "移动 CMIN2", "精品"
+elif "4134" in S:
+    line, quality = "163 骨干", "普通"
+elif "4837" in S:
+    line, quality = "联通 169", "普通"
+elif "58453" in S:
+    line, quality = "移动 CMI", "普通"
+elif "4812" in S:
+    line, quality = "中国电信", "普通"
+elif "4808" in S:
+    line, quality = "中国联通", "普通"
+elif S & {"9808", "56040", "10099"}:
+    line, quality = "中国移动", "普通"
+else:
+    line, quality = "", ""
+print(json.dumps({"line": line, "quality": quality}, ensure_ascii=False))
+' 2>/dev/null
 }
 
 test_route() {
@@ -500,45 +534,58 @@ test_route() {
     local out
     out=$(nexttrace --json --no-color -q 1 -m 20 "$ip" 2>/dev/null)
 
-    # 在远端把 JSON 压成"线路 + 延迟 + 跳数"，**顺便把任何 IP 抹掉**
+    # 在远端把 JSON 压成"线路 + 质量 + 延迟 + 跳数"，**顺便把任何 IP 抹掉**
     local brief
     brief=$(printf '%s' "$out" | python3 -c '
 import json, re, sys
-NAMES = {4809:"CN2 GIA",4812:"CN2 GT",4134:"163 骨干",9929:"联通 9929",
-         4837:"联通 4837",4808:"联通 4808",58807:"移动 CMIN2",58453:"移动 CMI",
-         9808:"移动 9808",56048:"移动 56048",10099:"移动 10099"}
-RANK  = {4809:1,9929:2,58807:3,58453:4,4812:5,4837:6,4808:7,9808:8,56048:9,10099:10,4134:11}
-IPRE  = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[0-9a-fA-F:]{6,}\b")
+IPRE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|(?:[0-9a-fA-F]{1,4}:){2,}[0-9a-fA-F]{0,4}")
 try:
     d = json.load(sys.stdin)
 except Exception:
     print(""); raise SystemExit
 
-best_asn, best_rank, hops, last_rtt = "", 99, 0, 0
-for hop in d.get("Hops") or []:
-    for probe in (hop if isinstance(hop, list) else [hop]):
-        if not isinstance(probe, dict):
+hops, last_rtt, asns = 0, 0, []
+for hop in (d.get("Hops") or []):
+    for p in (hop if isinstance(hop, list) else [hop]):
+        if not isinstance(p, dict):
             continue
         hops += 1
-        rtt = probe.get("RTT") or 0
-        # ⚠️ nexttrace 的 RTT 是**纳秒**（实测首跳 484821 -> 0.5ms，
-        # 末跳 64215754 -> 64.2ms，除以 1e6 才对得上）。
-        # 除以 1e3 会得到 1000 倍大的数字，看起来像"延迟 500ms"。
-        if probe.get("Success") and rtt > 0:
-            last_rtt = rtt / 1e6      # 取**末跳** = 端到端延迟
-        geo = probe.get("Geo") or {}
-        asn = str(geo.get("asnumber") or "").strip()
-        if asn.isdigit():
-            r = RANK.get(int(asn), 99)
-            if r < best_rank:
-                best_rank, best_asn = r, asn
-out = {
-    "line": NAMES.get(int(best_asn), "") if best_asn.isdigit() else "",
-    "asn": best_asn,
-    "hops": hops,
-    "latency_ms": round(last_rtt, 1),
-}
-# 兜底：万一有 IP 漏进来，这里再抹一遍。宁可信息少，也不泄露地址。
+        rtt = p.get("RTT") or 0
+        # ⚠️ nexttrace 的 RTT 是**纳秒**（首跳 484821 -> 0.5ms，
+        # 末跳 64215754 -> 64.2ms）。除以 1e3 会得到 1000 倍大的数字。
+        if p.get("Success") and rtt > 0:
+            last_rtt = rtt / 1e6          # 取**末跳** = 端到端延迟
+        a = str((p.get("Geo") or {}).get("asnumber") or "").strip()
+        if a.isdigit() and a not in asns:
+            asns.append(a)
+
+# 线路判定：看**整条路径的 ASN 集合**，不是某一个值。
+# CN2 GIA 和 GT 共用 AS4809，区别在国内段走不走 163。
+S = set(asns)
+if "4809" in S:
+    line, quality = ("CN2 GT", "普通") if "4134" in S else ("CN2 GIA", "精品")
+elif "9929" in S:
+    line, quality = "联通 9929 (CUII)", "精品"
+elif "58807" in S:
+    line, quality = "移动 CMIN2", "精品"
+elif "4134" in S:
+    line, quality = "163 骨干", "普通"
+elif "4837" in S:
+    line, quality = "联通 169", "普通"
+elif "58453" in S:
+    line, quality = "移动 CMI", "普通"
+elif "4812" in S:
+    line, quality = "中国电信", "普通"
+elif "4808" in S:
+    line, quality = "中国联通", "普通"
+elif S & {"9808", "56040", "10099"}:
+    line, quality = "中国移动", "普通"
+else:
+    line, quality = "", ""
+
+# asns 只用于内部分类，**不写进输出** —— 对访客没用，还多一份泄露面
+out = {"line": line, "quality": quality,
+       "hops": hops, "latency_ms": round(last_rtt, 1)}
 print(IPRE.sub("[已隐去]", json.dumps(out, ensure_ascii=False)))
 ' 2>/dev/null)
 
