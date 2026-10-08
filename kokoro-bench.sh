@@ -363,42 +363,65 @@ sys.stdout.write(s[i:j+1] if i>=0 and j>i else "")
   fi
 
   # 把它的结构翻译成我们的：只保留卡片上要用的字段
+  #
+  # ⚠️ **不输出任何 IP**：IPQuality 的原始 JSON 里有地址，这里只取
+  # 类型/ASN/组织/风险分/黑名单/解锁这些**描述性**字段。
+  # 最后再统一过一遍正则兜底，宁可少点信息也不泄露地址。
   local brief
   brief=$(printf '%s' "$js" | python3 -c '
-import json,sys
+import json,re,sys
+IPRE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 try:
     d=json.load(sys.stdin)
-except Exception as e:
+except Exception:
     sys.exit(1)
 info=d.get("Info") or {}
 score=d.get("Score") or {}
 media=d.get("Media") or {}
+mail=d.get("Mail") or {}
+blk=mail.get("DNSBlacklist") or {}
+
 short={"DisneyPlus":"Disney+","AmazonPrimeVideo":"Prime","Youtube":"YouTube"}
-unlocked=[]; locked=[]; detail={}
+unlocked=[]; locked=[]
 for k in sorted(media):
     v=media.get(k) or {}
-    st=v.get("Status") or ""
     name=short.get(k,k)
-    detail[name]={"status":st,"region":v.get("Region") or ""}
-    (unlocked if st=="解锁" else locked).append(name)
+    (unlocked if (v.get("Status") or "")=="解锁" else locked).append(name)
+
 def num(x):
     try: return float(str(x).replace("%",""))
     except Exception: return None
+
+# IP 用途：各数据库怎么分类这个 IP（机房/家宽/商业…），取众数当结论
+usage={}
+for db,v in (d.get("Type") or {}).get("Usage",{}).items():
+    if v: usage[db]=v
+consensus=""
+if usage:
+    from collections import Counter
+    consensus=Counter(usage.values()).most_common(1)[0][0]
+
 out={
   "ip_type": info.get("Type") or "",
+  "usage": consensus,
+  "usage_detail": usage,
   "org": info.get("Organization") or "",
   "asn": info.get("ASN") or "",
   "city": info.get("City") or "",
-  "country": info.get("Country") or info.get("CountryCode") or "",
+  "country": info.get("Country") or "",
   "risk_scamalytics": num(score.get("SCAMALYTICS")),
   "risk_abuseipdb": num(score.get("AbuseIPDB")),
   "risk_dbip": num(score.get("DBIP")),
+  "blacklist_total": blk.get("Total"),
+  "blacklist_clean": blk.get("Clean"),
+  "blacklist_marked": blk.get("Marked"),
+  "blacklist_listed": blk.get("Blacklisted"),
   "unlocked": unlocked,
   "locked": locked,
   "unlock_total": len(media),
-  "unlock_detail": detail,
 }
-print(json.dumps(out,ensure_ascii=False))
+txt=json.dumps(out,ensure_ascii=False)
+print(IPRE.sub("[已隐去]", txt))
 ' 2>/dev/null)
 
   if [ -z "$brief" ]; then
@@ -408,14 +431,55 @@ print(json.dumps(out,ensure_ascii=False))
   ev_result ip true "$brief"
 }
 
-# 6) 回程路由：nexttrace 优先，装不上就跳过（不硬凑）
+# 6) 回程线路：判断走的是哪条骨干，而不是"几跳"
+#
+# ⚠️ **绝不输出任何 IP**：服务器自己的、中间跳的、目标的，一个都不采集。
+# 只留"线路名 + 延迟 + 跳数"。
+#
+# 判据是路径上的 **ASN**（nexttrace 的 Geo.asnumber）。这是社区通行做法：
+# 看回程经过哪家骨干，就知道是 CN2 GIA 还是普通 163。
+route_name_of_asn() {
+  case "$1" in
+    4809)  echo "CN2 GIA" ;;
+    4812)  echo "CN2 GT" ;;
+    4134)  echo "163 骨干" ;;
+    9929)  echo "联通 9929" ;;
+    4837)  echo "联通 4837" ;;
+    4808)  echo "联通 4808" ;;
+    58807) echo "移动 CMIN2" ;;
+    58453) echo "移动 CMI" ;;
+    9808)  echo "移动 9808" ;;
+    56048) echo "移动 56048" ;;
+    10099) echo "移动 10099" ;;
+    *)     echo "" ;;
+  esac
+}
+
+# 优先级：数字越小越"高级"。路径上同时出现多个时取最好的那个 ——
+# 一条走了 4809 的线路，不该因为中间蹭了一下 4134 就被判成 163。
+route_rank() {
+  case "$1" in
+    4809) echo 1 ;;  # CN2 GIA
+    9929) echo 2 ;;  # 联通 9929
+    58807) echo 3 ;; # 移动 CMIN2
+    58453) echo 4 ;; # 移动 CMI
+    4812) echo 5 ;;  # CN2 GT
+    4837) echo 6 ;;  # 联通 4837
+    4808) echo 7 ;;
+    9808) echo 8 ;;
+    56048) echo 9 ;;
+    10099) echo 10 ;;
+    4134) echo 11 ;; # 163 骨干（普通）
+    *) echo 99 ;;
+  esac
+}
+
 test_route() {
-  ev_progress route 10 "准备回程路由"
+  ev_progress route 10 "准备回程线路检测"
   if ! have nexttrace; then
     install_pkg nexttrace || true
   fi
   if ! have nexttrace; then
-    # 官方一键装法；装不上就明确说"跳过"，不要编造结果
     say "尝试用官方脚本安装 nexttrace"
     curl -fsSL --max-time 90 nxtrace.org/nt 2>/dev/null | bash >/dev/null 2>&1 || true
   fi
@@ -424,31 +488,68 @@ test_route() {
     return
   fi
 
-  # 三个国内代表目标，分别对应电信/联通/移动的骨干
+  # 三网各一个代表目标。**目标 IP 本身不写进输出**，只用来发探测。
   local targets="202.96.209.133 123.125.99.1 211.136.192.6"
-  local names="电信 联通 移动"
-  local i=0 json_parts=""
-  set -- $targets
-  local name_arr=(电信 联通 移动)
+  local names=(电信 联通 移动)
+  local i=0 parts=""
   for ip in $targets; do
-    local nm=${name_arr[$i]}
-    say "回程路由 → $nm ($ip)"
-    ev_progress route $(( 20 + i * 25 )) "追踪到 $nm"
-    local t
-    t=$(nexttrace --json --no-color -q 1 -m 20 "$ip" 2>/dev/null)
-    local hops
-    hops=$(printf '%s' "$t" | python3 -c '
-import json,sys
-try: d=json.load(sys.stdin)
-except Exception: sys.exit(0)
-h=d.get("Hops") or d.get("hops") or []
-print(len(h))
+    local nm=${names[$i]}
+    say "回程线路 → $nm"
+    ev_progress route $(( 20 + i * 25 )) "探测 $nm 回程"
+
+    local out
+    out=$(nexttrace --json --no-color -q 1 -m 20 "$ip" 2>/dev/null)
+
+    # 在远端把 JSON 压成"线路 + 延迟 + 跳数"，**顺便把任何 IP 抹掉**
+    local brief
+    brief=$(printf '%s' "$out" | python3 -c '
+import json, re, sys
+NAMES = {4809:"CN2 GIA",4812:"CN2 GT",4134:"163 骨干",9929:"联通 9929",
+         4837:"联通 4837",4808:"联通 4808",58807:"移动 CMIN2",58453:"移动 CMI",
+         9808:"移动 9808",56048:"移动 56048",10099:"移动 10099"}
+RANK  = {4809:1,9929:2,58807:3,58453:4,4812:5,4837:6,4808:7,9808:8,56048:9,10099:10,4134:11}
+IPRE  = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[0-9a-fA-F:]{6,}\b")
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(""); raise SystemExit
+
+best_asn, best_rank, hops, last_rtt = "", 99, 0, 0
+for hop in d.get("Hops") or []:
+    for probe in (hop if isinstance(hop, list) else [hop]):
+        if not isinstance(probe, dict):
+            continue
+        hops += 1
+        rtt = probe.get("RTT") or 0
+        # ⚠️ nexttrace 的 RTT 是**纳秒**（实测首跳 484821 -> 0.5ms，
+        # 末跳 64215754 -> 64.2ms，除以 1e6 才对得上）。
+        # 除以 1e3 会得到 1000 倍大的数字，看起来像"延迟 500ms"。
+        if probe.get("Success") and rtt > 0:
+            last_rtt = rtt / 1e6      # 取**末跳** = 端到端延迟
+        geo = probe.get("Geo") or {}
+        asn = str(geo.get("asnumber") or "").strip()
+        if asn.isdigit():
+            r = RANK.get(int(asn), 99)
+            if r < best_rank:
+                best_rank, best_asn = r, asn
+out = {
+    "line": NAMES.get(int(best_asn), "") if best_asn.isdigit() else "",
+    "asn": best_asn,
+    "hops": hops,
+    "latency_ms": round(last_rtt, 1),
+}
+# 兜底：万一有 IP 漏进来，这里再抹一遍。宁可信息少，也不泄露地址。
+print(IPRE.sub("[已隐去]", json.dumps(out, ensure_ascii=False)))
 ' 2>/dev/null)
-    [ -n "$json_parts" ] && json_parts="$json_parts,"
-    json_parts="$json_parts\"$(jesc "$nm")\":{\"target\":\"$ip\",\"hops\":${hops:-0}}"
-    i=$((i+1))
+
+    if [ -z "$brief" ]; then
+      brief='{"line":"","asn":"","hops":0,"latency_ms":0,"error":"探测失败"}'
+    fi
+    [ -n "$parts" ] && parts="$parts,"
+    parts="$parts\"$nm\":$brief"
+    i=$((i + 1))
   done
-  ev_result route true "{$json_parts}"
+  ev_result route true "{$parts}"
 }
 
 # ---------- 调度 ----------
