@@ -1,0 +1,5 @@
+# 行尾统一 LF。
+# ⚠️ 对 shell 脚本是必须的：CRLF 的 .sh 在 Linux 上会报
+#    `/bin/bash^M: bad interpreter`。这个脚本是直接在小鸡上跑的。
+* text=auto eol=lf
+*.sh text eol=lf
