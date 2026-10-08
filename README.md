@@ -5,7 +5,7 @@
 给探针、监控面板、自动化流水线用的 —— 不是给人看的彩色终端。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kokoro-probe/kokoro-bench/main/kokoro-bench.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Vincentkeio/kokoro-bench/main/kokoro-bench.sh | bash
 ```
 
 ---
