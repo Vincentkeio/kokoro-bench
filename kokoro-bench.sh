@@ -431,83 +431,9 @@ print(IPRE.sub("[已隐去]", txt))
   ev_result ip true "$brief"
 }
 
-# 6) 回程线路：判断走的是哪条骨干，而不是"几跳"
-#
-# ⚠️ **绝不输出任何 IP**：服务器自己的、中间跳的、目标的，一个都不采集。
-# 只留"线路名 + 延迟 + 跳数"。
-#
-# 判据是路径上的 **ASN**（nexttrace 的 Geo.asnumber）。这是社区通行做法：
-# 看回程经过哪家骨干，就知道是 CN2 GIA 还是普通 163。
-route_name_of_asn() {
-  case "$1" in
-    4809)  echo "CN2" ;;
-    9929)  echo "联通 9929 (CUII)" ;;
-    58807) echo "移动 CMIN2" ;;
-    4134)  echo "163 骨干" ;;
-    4837)  echo "联通 169" ;;
-    58453) echo "移动 CMI" ;;
-    4812)  echo "中国电信" ;;
-    4808)  echo "中国联通" ;;
-    9808)  echo "中国移动" ;;
-    56040) echo "中国移动" ;;
-    10099) echo "中国移动" ;;
-    *)     echo "" ;;
-  esac
-}
-
-# ⚠️ **CN2 GIA 和 CN2 GT 共用 AS4809**，靠单个 ASN 分不出来。
-# 区别在"国内段走什么"：
-#   GIA = 全程 AS4809（国内段也是 CN2，贵、稳）
-#   GT  = 国际段 AS4809，国内段走 163(AS4134)（便宜、高峰期会堵）
-# 所以判据是**整条路径的 ASN 集合**，不是某一个值。
-#
-# 另外：AS4812/4808 这类是"中国电信/中国联通"的普通 ASN，
-# **不是 CN2**。之前把它们标成 "CN2 GT" 是错的 —— 会被误读成好线路。
-route_classify() {
-  python3 -c '
-import json,sys
-PREMIUM_4809 = "CN2"
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print(json.dumps({"line":"","quality":"","asns":[]}, ensure_ascii=False)); raise SystemExit
-
-asns = []
-for hop in (d.get("Hops") or []):
-    for p in (hop if isinstance(hop, list) else [hop]):
-        if not isinstance(p, dict):
-            continue
-        a = str((p.get("Geo") or {}).get("asnumber") or "").strip()
-        if a.isdigit() and a not in asns:
-            asns.append(a)
-S = set(asns)
-
-# 精品线路：出现这些才算
-if "4809" in S:
-    # GT 的国内段走 163；全程 4809 才是 GIA
-    line, quality = ("CN2 GT", "普通") if "4134" in S else ("CN2 GIA", "精品")
-elif "9929" in S:
-    line, quality = "联通 9929 (CUII)", "精品"
-elif "58807" in S:
-    line, quality = "移动 CMIN2", "精品"
-elif "4134" in S:
-    line, quality = "163 骨干", "普通"
-elif "4837" in S:
-    line, quality = "联通 169", "普通"
-elif "58453" in S:
-    line, quality = "移动 CMI", "普通"
-elif "4812" in S:
-    line, quality = "中国电信", "普通"
-elif "4808" in S:
-    line, quality = "中国联通", "普通"
-elif S & {"9808", "56040", "10099"}:
-    line, quality = "中国移动", "普通"
-else:
-    line, quality = "", ""
-print(json.dumps({"line": line, "quality": quality}, ensure_ascii=False))
-' 2>/dev/null
-}
-
+# 6) 回程线路：按热门三网脚本的做法，分别探测京/沪/深的三网目标。
+# TCP 443 更接近实际业务流量；线路通过路径 ASN 识别，目标和中间 IP 只在
+# 本机探测时使用，绝不写入 NDJSON。没有骨干 ASN 证据时明确回报“未识别”。
 test_route() {
   ev_progress route 10 "准备回程线路检测"
   if ! have nexttrace; then
@@ -522,81 +448,80 @@ test_route() {
     return
   fi
 
-  # 三网各一个代表目标。**目标 IP 本身不写进输出**，只用来发探测。
-  local targets="202.96.209.133 123.125.99.1 211.136.192.6"
-  local names=(电信 联通 移动)
-  local i=0 parts=""
-  for ip in $targets; do
-    local nm=${names[$i]}
-    say "回程线路 → $nm"
-    ev_progress route $(( 20 + i * 25 )) "探测 $nm 回程"
+  # 地址与热门 mtr_trace 的北京/上海/深圳三地三网探测相同。
+  # 每网三个结果单独分类，避免把某地线路误概括成全网统一线路。
+  local targets=(
+    "北京:电信:219.141.136.12" "北京:联通:202.106.50.1" "北京:移动:221.179.155.161"
+    "上海:电信:202.96.209.133" "上海:联通:210.22.97.1" "上海:移动:211.136.112.200"
+    "深圳:电信:58.60.188.222" "深圳:联通:210.21.196.6" "深圳:移动:120.196.165.24"
+  )
+  local i=0 telecom="" unicom="" mobile=""
+  for target in "${targets[@]}"; do
+    IFS=: read -r city nm ip <<< "$target"
+    say "回程线路 → ${city}${nm}"
+    ev_progress route $(( 10 + i * 9 )) "TCP 探测 ${city}${nm} 回程"
 
-    local out
-    out=$(nexttrace --json --no-color -q 1 -m 20 "$ip" 2>/dev/null)
-
-    # 在远端把 JSON 压成"线路 + 质量 + 延迟 + 跳数"，**顺便把任何 IP 抹掉**
-    local brief
+    local out brief
+    out=$(nexttrace --tcp --port 443 --json --no-color --no-rdns -q 3 -m 20 "$ip" 2>/dev/null)
     brief=$(printf '%s' "$out" | python3 -c '
-import json, re, sys
-IPRE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|(?:[0-9a-fA-F]{1,4}:){2,}[0-9a-fA-F]{0,4}")
+import json, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
-    print(""); raise SystemExit
+    print("路径未识别"); raise SystemExit
 
-hops, last_rtt, asns = 0, 0, []
+asns = []
 for hop in (d.get("Hops") or []):
     for p in (hop if isinstance(hop, list) else [hop]):
         if not isinstance(p, dict):
             continue
-        hops += 1
-        rtt = p.get("RTT") or 0
-        # ⚠️ nexttrace 的 RTT 是**纳秒**（首跳 484821 -> 0.5ms，
-        # 末跳 64215754 -> 64.2ms）。除以 1e3 会得到 1000 倍大的数字。
-        if p.get("Success") and rtt > 0:
-            last_rtt = rtt / 1e6          # 取**末跳** = 端到端延迟
-        a = str((p.get("Geo") or {}).get("asnumber") or "").strip()
+        geo = p.get("Geo") or p.get("geo") or {}
+        a = str(geo.get("asnumber") or geo.get("ASNumber") or "").strip()
+        if a.upper().startswith("AS"):
+            a = a[2:]
         if a.isdigit() and a not in asns:
             asns.append(a)
-
-# 线路判定：看**整条路径的 ASN 集合**，不是某一个值。
-# CN2 GIA 和 GT 共用 AS4809，区别在国内段走不走 163。
 S = set(asns)
+
 if "4809" in S:
-    line, quality = ("CN2 GT", "普通") if "4134" in S else ("CN2 GIA", "精品")
+    label = "CN2 GT（AS4809+AS4134）" if "4134" in S else "CN2（AS4809，GT/GIA未确认）"
 elif "9929" in S:
-    line, quality = "联通 9929 (CUII)", "精品"
+    label = "联通 9929（AS9929）"
 elif "58807" in S:
-    line, quality = "移动 CMIN2", "精品"
+    label = "移动 CMIN2（AS58807）"
 elif "4134" in S:
-    line, quality = "163 骨干", "普通"
+    label = "163 骨干（AS4134）"
 elif "4837" in S:
-    line, quality = "联通 169", "普通"
+    label = "联通 4837/169（AS4837）"
 elif "58453" in S:
-    line, quality = "移动 CMI", "普通"
+    label = "移动 CMI（AS58453）"
+elif "10099" in S:
+    label = "联通国际（AS10099；骨干未确认）"
 elif "4812" in S:
-    line, quality = "中国电信", "普通"
+    label = "电信网络（AS4812；骨干未识别）"
 elif "4808" in S:
-    line, quality = "中国联通", "普通"
-elif S & {"9808", "56040", "10099"}:
-    line, quality = "中国移动", "普通"
+    label = "联通网络（AS4808；骨干未识别）"
+elif S & {"9808", "56040"}:
+    used = "/".join(sorted(S & {"9808", "56040"}))
+    label = "移动网络（AS" + used + "；骨干未识别）"
 else:
-    line, quality = "", ""
+    label = "路径 ASN 不足，未识别"
 
-# asns 只用于内部分类，**不写进输出** —— 对访客没用，还多一份泄露面
-out = {"line": line, "quality": quality,
-       "hops": hops, "latency_ms": round(last_rtt, 1)}
-print(IPRE.sub("[已隐去]", json.dumps(out, ensure_ascii=False)))
+# 不回传 hop 数或 RTT：未确认目标可达时，最后一个响应跳的 RTT 不是端到端延迟。
+print(label)
 ' 2>/dev/null)
-
-    if [ -z "$brief" ]; then
-      brief='{"line":"","asn":"","hops":0,"latency_ms":0,"error":"探测失败"}'
-    fi
-    [ -n "$parts" ] && parts="$parts,"
-    parts="$parts\"$nm\":$brief"
+    [ -n "$brief" ] || brief='路径未识别'
+    case "$nm" in
+      电信) [ -n "$telecom" ] && telecom="$telecom / "; telecom="${telecom}${city} ${brief}" ;;
+      联通) [ -n "$unicom" ] && unicom="$unicom / "; unicom="${unicom}${city} ${brief}" ;;
+      移动) [ -n "$mobile" ] && mobile="$mobile / "; mobile="${mobile}${city} ${brief}" ;;
+    esac
     i=$((i + 1))
   done
-  ev_result route true "{$parts}"
+  # 构造字段 JSON 时直接用 python 做转义，防止线路字符串导致 JSON 损坏。
+  local route_json
+  route_json=$(python3 -c 'import json,sys; print(json.dumps({"电信":{"line":sys.argv[1]},"联通":{"line":sys.argv[2]},"移动":{"line":sys.argv[3]}},ensure_ascii=False,separators=(",",":"))' "$telecom" "$unicom" "$mobile")
+  ev_result route true "$route_json"
 }
 
 # ---------- 调度 ----------
