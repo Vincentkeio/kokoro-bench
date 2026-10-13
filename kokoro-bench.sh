@@ -140,7 +140,7 @@ install_pkg() {
     i=$((i + 1))
     sleep 3
   done
-  say "依赖安装失败: ${pkgs[*]}（请检查软件源、网络与包管理器锁）"
+  say "依赖安装失败: ${pkgs[*]}（${PKG_ERROR:-请检查软件源、网络与包管理器锁}）"
   return 1
 }
 
@@ -401,6 +401,16 @@ test_net() {
 test_ip() {
   if ! have python3; then install_pkg python3 || true; fi
   if ! have python3; then ev_error ip "IPQuality 结果解析需要 python3，自动安装失败"; return; fi
+  if ! have curl || ! have jq || ! have bc || ! have dig || ! have nc || ! have ip; then
+    local ip_packages=(curl jq bc)
+    if have apk; then ip_packages+=(bind-tools netcat-openbsd iproute2)
+    elif have apt-get; then ip_packages+=(dnsutils netcat-openbsd iproute2)
+    else ip_packages+=(bind-utils nmap-ncat iproute); fi
+    install_pkg "${ip_packages[@]}" || true
+    for component in curl jq bc dig nc ip; do
+      if ! have "$component"; then ev_error ip "IPQuality 所需组件 $component 自动安装失败"; return; fi
+    done
+  fi
   ev_progress ip 10 "拉取 IP 质量脚本"
   local raw
   raw=$(curl -fsSL --max-time 60 IP.Check.Place 2>/dev/null)
@@ -504,6 +514,8 @@ print(IPRE.sub("[已隐去]", txt))
 # TCP 443 更接近实际业务流量；线路通过路径 ASN 识别，目标和中间 IP 只在
 # 本机探测时使用，绝不写入 NDJSON。没有骨干 ASN 证据时明确回报“未识别”。
 test_route() {
+  if ! have python3; then install_pkg python3 || true; fi
+  if ! have python3; then ev_error route "回程路由解析需要 python3，自动安装失败"; return; fi
   ev_progress route 10 "准备回程线路检测"
   local nexttrace_bin=""
   if have nexttrace; then
@@ -633,12 +645,23 @@ done
 
 if [ "$PREPARE_ONLY" = 1 ]; then
   packages=()
-  for component in curl python3 sysbench fio speedtest-cli; do
+  for component in curl python3 jq bc sysbench fio speedtest-cli; do
     have "$component" || packages+=("$component")
   done
+  if ! have dig; then
+    if have apk; then packages+=(bind-tools)
+    elif have apt-get; then packages+=(dnsutils)
+    else packages+=(bind-utils); fi
+  fi
+  if ! have nc; then
+    if have apk || have apt-get; then packages+=(netcat-openbsd); else packages+=(nmap-ncat); fi
+  fi
+  if ! have ip; then
+    if have apk || have apt-get; then packages+=(iproute2); else packages+=(iproute); fi
+  fi
   if [ "${#packages[@]}" -gt 0 ]; then
     install_pkg "${packages[@]}" || exit 1
-    for component in "${packages[@]}"; do have "$component" || exit 1; done
+    for component in curl python3 jq bc sysbench fio speedtest-cli dig nc ip; do have "$component" || exit 1; done
   fi
   say "固定测试组件已就绪"
   exit 0

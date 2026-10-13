@@ -42,7 +42,7 @@ cp "$FIXTURE_ROOT/sysbench-source" "$FIXTURE_ROOT/bin/sysbench"
 chmod 755 "$FIXTURE_ROOT/bin/sysbench" ;;
 *) exit 1 ;;
 esac
-'''.replace('chmod 755 "$FIXTURE_ROOT/bin/sysbench" ;;','chmod 755 "$FIXTURE_ROOT/bin/sysbench"\nfor tool in fio speedtest-cli; do cp "$FIXTURE_ROOT/bin/sysbench" "$FIXTURE_ROOT/bin/$tool"; done ;;'))
+'''.replace('chmod 755 "$FIXTURE_ROOT/bin/sysbench" ;;','chmod 755 "$FIXTURE_ROOT/bin/sysbench"\nfor tool in fio speedtest-cli jq bc dig nc ip; do cp "$FIXTURE_ROOT/bin/sysbench" "$FIXTURE_ROOT/bin/$tool"; done ;;'))
             tool("python3", 'exec "$FIXTURE_PYTHON" "$@"\n')
             (root / "upstream").write_text('''#!/usr/bin/env bash
 private=no
