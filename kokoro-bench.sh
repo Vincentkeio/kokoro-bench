@@ -413,7 +413,7 @@ test_ip() {
   fi
   ev_progress ip 10 "拉取 IP 质量脚本"
   local raw
-  raw=$(curl -fsSL --max-time 60 IP.Check.Place 2>/dev/null)
+  raw=$(curl -fsSL --max-time 60 https://IP.Check.Place 2>/dev/null)
   if [ -z "$raw" ]; then
     ev_error ip "下载 IPQuality 脚本失败（网络不通？）"
     return
