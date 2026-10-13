@@ -39,6 +39,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCHEMA=1
 ONLY=""
 WANT_INSTALL=1
+PREPARE_ONLY=0
 APT_REFRESHED=0
 FAILED=""
 PKG_ERROR=""
@@ -65,7 +66,10 @@ say() { printf '\033[36m▸\033[0m %s\n' "$*" >&2; }
 
 ev_start()   { emit "{\"event\":\"start\",\"schema\":$SCHEMA,\"tests\":[$1]}"; }
 ev_progress(){ emit "{\"event\":\"progress\",\"test\":\"$(jesc "$1")\",\"pct\":$2,\"msg\":\"$(jesc "$3")\"}"; }
-ev_result()  { emit "{\"event\":\"result\",\"test\":\"$(jesc "$1")\",\"ok\":$2,\"data\":$3}"; }
+ev_result()  {
+  if [ -z "$3" ]; then ev_error "$1" "测试未生成有效的结构化结果"; return 1; fi
+  emit "{\"event\":\"result\",\"test\":\"$(jesc "$1")\",\"ok\":$2,\"data\":$3}"
+}
 ev_error()   {
   emit "{\"event\":\"result\",\"test\":\"$(jesc "$1")\",\"ok\":false,\"error\":\"$(jesc "$2")\"}"
   case " $FAILED " in *" $1 "*) ;; *) FAILED="$FAILED $1" ;; esac
@@ -83,9 +87,10 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # Package installs are local, fixed dependencies; bounded waits avoid hanging
 # on a package lock or a broken mirror. Refresh apt indexes after a failed try.
 pkg_run() {
-  local log rc
+  local log rc budget=180
+  [ "$1" = systemctl ] && budget=500
   log=$(mktemp) || return 1
-  if have timeout; then timeout -k 5s 180s "$@" >"$log" 2>&1; else "$@" >"$log" 2>&1; fi
+  if have timeout; then timeout -k 5s "${budget}s" "$@" >"$log" 2>&1; else "$@" >"$log" 2>&1; fi
   rc=$?
   PKG_ERROR=""
   if [ "$rc" != 0 ]; then
@@ -106,6 +111,12 @@ install_pkg() {
   [ "$(id -u)" = "0" ] || { say "安装依赖需要 root 权限: $*"; return 1; }
   local pkgs=("$@")
   say "安装依赖: ${pkgs[*]}"
+  if [ ! -w /usr ] && have systemctl && [ "$(systemctl show kokoro-test-dependencies.service -p LoadState --value 2>/dev/null)" = loaded ]; then
+    say "通过本机固定组件安装服务准备测试依赖"
+    if pkg_run systemctl start kokoro-test-dependencies.service; then return 0; fi
+    PKG_ERROR="固定组件安装服务失败，请查看 journalctl -u kokoro-test-dependencies.service"
+    return 1
+  fi
   # 重试 3 次：**并发跑测试时 apt 锁会冲突**（实测两个脚本同时装包，
   # 后到的那个会静默失败，然后降级到很差的兜底方案）。
   local i=0
@@ -424,7 +435,9 @@ test_ip() {
 import json,re,sys
 IPRE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 try:
-    d=json.load(sys.stdin)
+    # Upstream appends IPv4 then IPv6 as separate JSON documents to one file.
+    d,end=json.JSONDecoder().raw_decode(sys.stdin.read().lstrip())
+    if not isinstance(d,dict): raise ValueError("report is not an object")
 except Exception:
     sys.exit(1)
 info=d.get("Info") or {}
@@ -444,23 +457,27 @@ def num(x):
     try: return float(str(x).replace("%",""))
     except Exception: return None
 
+def text(value):
+    if isinstance(value,dict): value=value.get("Name") or ""
+    return value if isinstance(value,str) and value!="null" else ""
+
 # IP 用途：各数据库怎么分类这个 IP（机房/家宽/商业…），取众数当结论
 usage={}
 for db,v in (d.get("Type") or {}).get("Usage",{}).items():
-    if v: usage[db]=v
+    if isinstance(v,str) and v and v!="null": usage[db]=v
 consensus=""
 if usage:
     from collections import Counter
     consensus=Counter(usage.values()).most_common(1)[0][0]
 
 out={
-  "ip_type": info.get("Type") or "",
+  "ip_type": text(info.get("Type")),
   "usage": consensus,
   "usage_detail": usage,
-  "org": info.get("Organization") or "",
-  "asn": info.get("ASN") or "",
-  "city": info.get("City") or "",
-  "country": info.get("Country") or "",
+  "org": text(info.get("Organization")),
+  "asn": text(info.get("ASN")),
+  "city": text(info.get("City")),
+  "country": text(info.get("Country") or info.get("Region")),
   "risk_scamalytics": num(score.get("SCAMALYTICS")),
   "risk_abuseipdb": num(score.get("AbuseIPDB")),
   "risk_dbip": num(score.get("DBIP")),
@@ -582,7 +599,8 @@ print(label)
   done
   # 构造字段 JSON 时直接用 python 做转义，防止线路字符串导致 JSON 损坏。
   local route_json
-  route_json=$(python3 -c 'import json,sys; print(json.dumps({"电信":{"line":sys.argv[1]},"联通":{"line":sys.argv[2]},"移动":{"line":sys.argv[3]}},ensure_ascii=False,separators=(",",":"))' "$telecom" "$unicom" "$mobile")
+  route_json=$(python3 -c 'import json,sys; print(json.dumps({"电信":{"line":sys.argv[1]},"联通":{"line":sys.argv[2]},"移动":{"line":sys.argv[3]}},ensure_ascii=False,separators=(",",":")))' "$telecom" "$unicom" "$mobile")
+  if [ -z "$route_json" ]; then ev_error route "回程路由结果无法编码为 JSON"; return; fi
   ev_result route true "$route_json"
 }
 
@@ -607,10 +625,24 @@ while [ $# -gt 0 ]; do
     --only) ONLY="$2"; shift 2 ;;
     --list) echo "$ALL_TESTS"; exit 0 ;;
     --no-install) WANT_INSTALL=0; shift ;;
+    --prepare-only) PREPARE_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) shift ;;
   esac
 done
+
+if [ "$PREPARE_ONLY" = 1 ]; then
+  packages=()
+  for component in curl python3 sysbench fio speedtest-cli; do
+    have "$component" || packages+=("$component")
+  done
+  if [ "${#packages[@]}" -gt 0 ]; then
+    install_pkg "${packages[@]}" || exit 1
+    for component in "${packages[@]}"; do have "$component" || exit 1; done
+  fi
+  say "固定测试组件已就绪"
+  exit 0
+fi
 
 # 组装要跑的列表
 RUN=""
