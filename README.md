@@ -1,6 +1,6 @@
 # kokoro-bench
 
-一键测完一台 VPS 的**硬件 / 磁盘 / CPU / 网络 / IP 质量 / 回程路由**，输出**结构化 JSON**。
+一键测完一台 VPS 的**硬件 / 磁盘 / CPU / 内存读写 / 网络 / IP 质量 / 回程路由**，输出**结构化 JSON**。
 
 给探针、监控面板、自动化流水线用的 —— 不是给人看的彩色终端。
 
@@ -72,17 +72,19 @@ bash kokoro-bench.sh --no-install       # 不自动装依赖（缺啥降级/跳�
 | `env` | 环境预检（缺 `/dev/zero`、是否 root…） | 无 | — |
 | `sysinfo` | CPU 型号 / 核数 / 内存 / 磁盘 / 系统 / 虚拟化 | 无 | — |
 | `disk` | fio 顺序读写 + 4K 随机 IOPS | fio | dd（需 `/dev/zero`），否则报 skipped |
-| `cpu` | sysbench 单核 / 多核 | sysbench | openssl sha256 吞吐 |
+| `cpu` | sysbench 单核 / 多核 | sysbench | 自动安装；失败时明确回报原因 |
+| `memory` | sysbench 顺序读取 / 写入带宽（MiB/s） | sysbench | 自动安装；失败时明确回报原因 |
 | `net` | 上下行测速 + 延迟 | speedtest | curl 下载测速 |
 | `ip` | IP 类型 / 风险分 / 流媒体解锁 | python3 + xykt/IPQuality | 报错并跳过 |
 | `route` | 三网回程路由跳数 | nexttrace | 报错并跳过 |
 
 依赖**按需自动安装**（apt / dnf / yum / apk），装包失败会重试 3 次 ——
-并发跑多个测试时 apt 锁会冲突，一次失败就放弃太脆。
+安装遇到软件包索引缺失时会先更新索引再重试；等待包管理器锁和下载均有超时限制。
 
 `ip` 这一项复用的是社区事实标准 [xykt/IPQuality](https://github.com/xykt/IPQuality)：
 流媒体解锁要打一堆厂商接口、判断各种"地区不可用"的文案，自己实现很容易失效。
 **我们只做"翻译"（把它的 JSON 转成我们的结构），不重新发明。**
+通过 `-o` 读取 IPQuality 生成的 JSON 文件，使用隐私模式避免上传公开报告。某项失败会写入 `result.ok=false` 和最终 `done.failed`，不影响其他项输出。
 
 ---
 

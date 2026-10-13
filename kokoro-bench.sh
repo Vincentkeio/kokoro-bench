@@ -30,6 +30,7 @@
 # 装不上就降级到内置的兜底方案，不会因此整体失败。
 
 set -o pipefail
+export LC_ALL=C.UTF-8
 
 # The script is fetched into a per-run temp directory by the Agent. Keep any
 # fallback tool beside it so a user-level install never depends on PATH setup.
@@ -38,6 +39,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCHEMA=1
 ONLY=""
 WANT_INSTALL=1
+APT_REFRESHED=0
+FAILED=""
+PKG_ERROR=""
 
 # ---------- 基础工具 ----------
 
@@ -62,36 +66,70 @@ say() { printf '\033[36m▸\033[0m %s\n' "$*" >&2; }
 ev_start()   { emit "{\"event\":\"start\",\"schema\":$SCHEMA,\"tests\":[$1]}"; }
 ev_progress(){ emit "{\"event\":\"progress\",\"test\":\"$(jesc "$1")\",\"pct\":$2,\"msg\":\"$(jesc "$3")\"}"; }
 ev_result()  { emit "{\"event\":\"result\",\"test\":\"$(jesc "$1")\",\"ok\":$2,\"data\":$3}"; }
-ev_error()   { emit "{\"event\":\"result\",\"test\":\"$(jesc "$1")\",\"ok\":false,\"error\":\"$(jesc "$2")\"}"; }
+ev_error()   {
+  emit "{\"event\":\"result\",\"test\":\"$(jesc "$1")\",\"ok\":false,\"error\":\"$(jesc "$2")\"}"
+  case " $FAILED " in *" $1 "*) ;; *) FAILED="$FAILED $1" ;; esac
+}
 
 # now_ms 取毫秒时间戳。date +%s%3N 在 GNU coreutils 上有，BusyBox 没有。
-now_ms() { date +%s%3N 2>/dev/null || echo $(( $(date +%s) * 1000 )); }
+now_ms() {
+  local value
+  value=$(date +%s%3N 2>/dev/null)
+  case "$value" in ''|*[!0-9]*) echo $(( $(date +%s) * 1000 )) ;; *) echo "$value" ;; esac
+}
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# install_pkg 尽力装包，失败不报错（调用方会降级）。
+# Package installs are local, fixed dependencies; bounded waits avoid hanging
+# on a package lock or a broken mirror. Refresh apt indexes after a failed try.
+pkg_run() {
+  local log rc
+  log=$(mktemp) || return 1
+  if have timeout; then timeout -k 5s 180s "$@" >"$log" 2>&1; else "$@" >"$log" 2>&1; fi
+  rc=$?
+  PKG_ERROR=""
+  if [ "$rc" != 0 ]; then
+    if grep -qi 'read-only file system' "$log"; then PKG_ERROR="文件系统只读"
+    elif grep -qi 'no space left' "$log"; then PKG_ERROR="磁盘空间不足"
+    elif grep -qi 'could not resolve\|temporary failure resolving' "$log"; then PKG_ERROR="软件源 DNS 解析失败"
+    elif grep -qi 'could not get lock\|unable to acquire.*lock' "$log"; then PKG_ERROR="包管理器正在被其他进程占用"
+    elif grep -qi 'unable to locate package\|no match for argument' "$log"; then PKG_ERROR="软件源中找不到所需组件"
+    elif [ "$rc" = 124 ] || [ "$rc" = 137 ]; then PKG_ERROR="组件安装超时"
+    else PKG_ERROR="软件源下载或包管理器执行失败（退出码 $rc）"; fi
+  fi
+  rm -f -- "$log"
+  return "$rc"
+}
+
 install_pkg() {
   [ "$WANT_INSTALL" = "1" ] || return 1
-  local pkgs="$*"
-  say "安装依赖: $pkgs"
+  [ "$(id -u)" = "0" ] || { say "安装依赖需要 root 权限: $*"; return 1; }
+  local pkgs=("$@")
+  say "安装依赖: ${pkgs[*]}"
   # 重试 3 次：**并发跑测试时 apt 锁会冲突**（实测两个脚本同时装包，
   # 后到的那个会静默失败，然后降级到很差的兜底方案）。
   local i=0
   while [ $i -lt 3 ]; do
     if have apt-get; then
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkgs >/dev/null 2>&1 && return 0
+      DEBIAN_FRONTEND=noninteractive pkg_run apt-get -o DPkg::Lock::Timeout=60 -o Acquire::Retries=1 -o Acquire::http::Timeout=20 install -y -qq "${pkgs[@]}" >/dev/null 2>&1 && return 0
+      if [ "$APT_REFRESHED" = "0" ]; then
+        APT_REFRESHED=1
+        say "更新软件包索引后重试安装"
+        DEBIAN_FRONTEND=noninteractive pkg_run apt-get -o DPkg::Lock::Timeout=60 -o Acquire::Retries=1 -o Acquire::http::Timeout=20 update -qq >/dev/null 2>&1 || true
+      fi
     elif have dnf; then
-      dnf install -y -q $pkgs >/dev/null 2>&1 && return 0
+      pkg_run dnf install -y -q "${pkgs[@]}" >/dev/null 2>&1 && return 0
     elif have yum; then
-      yum install -y -q $pkgs >/dev/null 2>&1 && return 0
+      pkg_run yum install -y -q "${pkgs[@]}" >/dev/null 2>&1 && return 0
     elif have apk; then
-      apk add --no-cache $pkgs >/dev/null 2>&1 && return 0
+      pkg_run apk add --no-cache "${pkgs[@]}" >/dev/null 2>&1 && return 0
     else
       return 1
     fi
     i=$((i + 1))
     sleep 3
   done
+  say "依赖安装失败: ${pkgs[*]}（请检查软件源、网络与包管理器锁）"
   return 1
 }
 
@@ -259,16 +297,30 @@ test_cpu() {
     fi
   fi
 
-  # 兜底：openssl 算 sha256，纯 CPU 绑定，几乎处处都有
-  say "sysbench 不可用，降级用 openssl"
-  ev_progress cpu 60 "openssl 兜底"
-  local t0 t1 rate
-  t0=$(now_ms)
-  dd if=/dev/zero bs=1M count=64 2>/dev/null | openssl sha256 >/dev/null 2>&1
-  t1=$(now_ms)
-  local ms=$(( t1 - t0 ))
-  rate=$(awk "BEGIN{printf \"%.1f\", ($ms>0 ? 64*1000/$ms : 0)}")
-  ev_result cpu true "$(printf '{"sha256_mbs":%s,"elapsed_ms":%s,"tool":"openssl"}' "$rate" "$ms")"
+  ev_error cpu "CPU 跑分失败：sysbench 未安装或执行失败；${PKG_ERROR:-未返回有效跑分结果}"
+}
+
+# Memory bandwidth uses the same installed sysbench as CPU. No Agent-specific
+# extra command is needed; standalone and panel runs produce identical events.
+test_memory() {
+  ev_progress memory 10 "准备内存读写测试"
+  if ! have sysbench; then install_pkg sysbench || true; fi
+  if ! have sysbench; then
+    ev_error memory "内存读写测试失败：sysbench 自动安装失败；${PKG_ERROR:-请检查软件源、网络与包管理器锁}"
+    return
+  fi
+  local operation out rate read_rate="" write_rate=""
+  for operation in read write; do
+    ev_progress memory 50 "sysbench 内存 $operation"
+    out=$(sysbench memory --threads=1 --memory-oper="$operation" --memory-block-size=1M --memory-total-size=1T --time=3 run 2>/dev/null)
+    rate=$(printf '%s\n' "$out" | awk '/MiB\/sec/ {s=$0; sub(/.*\(/,"",s); split(s,v," "); print v[1]; exit}')
+    if ! [[ "$rate" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      ev_error memory "内存 $operation 测试失败：sysbench 未返回可解析的带宽结果"
+      return
+    fi
+    if [ "$operation" = read ]; then read_rate="$rate"; else write_rate="$rate"; fi
+  done
+  ev_result memory true "$(printf '{"read_mib_s":%s,"write_mib_s":%s,"tool":"sysbench"}' "$read_rate" "$write_rate")"
 }
 
 # 4) 网络测速：speedtest 优先，装不上就用 curl 下载兜底
@@ -336,6 +388,8 @@ test_net() {
 # 但把它那坨彩色输出里的 JSON 抠出来，转成我们的事件格式 ——
 # 我们只做"翻译"，不做"重新发明"。
 test_ip() {
+  if ! have python3; then install_pkg python3 || true; fi
+  if ! have python3; then ev_error ip "IPQuality 结果解析需要 python3，自动安装失败"; return; fi
   ev_progress ip 10 "拉取 IP 质量脚本"
   local raw
   raw=$(curl -fsSL --max-time 60 IP.Check.Place 2>/dev/null)
@@ -346,25 +400,19 @@ test_ip() {
   say "运行 IPQuality（约 2~5 分钟）"
   ev_progress ip 30 "检测 IP 数据库与流媒体解锁"
 
-  local out
-  out=$(printf '%s' "$raw" | bash -s -- -j -y 2>/dev/null)
-  if [ -z "$out" ]; then
-    ev_error ip "IPQuality 没有输出"
+  # Use IPQuality's documented JSON file interface. Private mode disables
+  # uploading a public report; progress/advertisements never enter our parser.
+  local work js rc
+  work=$(mktemp -d) || { ev_error ip "无法创建 IPQuality 临时目录"; return; }
+  printf '%s' "$raw" | bash -s -- -j -y -p -o "$work/result.json" >"$work/console.log" 2>&1
+  rc=$?
+  if [ ! -s "$work/result.json" ]; then
+    rm -rf -- "$work"
+    ev_error ip "IPQuality 未生成 JSON 结果文件（退出码 $rc），请检查依赖和网络后重试"
     return
   fi
-
-  # 抠出最外层 JSON（前面有彩色进度，后面有广告）
-  local js
-  js=$(printf '%s' "$out" | python3 -c '
-import sys
-s=sys.stdin.read()
-i=s.find("{"); j=s.rfind("}")
-sys.stdout.write(s[i:j+1] if i>=0 and j>i else "")
-' 2>/dev/null)
-  if [ -z "$js" ]; then
-    ev_error ip "IPQuality 输出里找不到 JSON"
-    return
-  fi
+  js=$(cat "$work/result.json")
+  rm -rf -- "$work"
 
   # 把它的结构翻译成我们的：只保留卡片上要用的字段
   #
@@ -540,7 +588,7 @@ print(label)
 
 # ---------- 调度 ----------
 
-ALL_TESTS="env sysinfo disk cpu net ip route"
+ALL_TESTS="env sysinfo disk cpu memory net ip route"
 
 usage() {
   cat >&2 <<EOF
