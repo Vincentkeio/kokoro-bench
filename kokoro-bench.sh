@@ -31,6 +31,10 @@
 
 set -o pipefail
 
+# The script is fetched into a per-run temp directory by the Agent. Keep any
+# fallback tool beside it so a user-level install never depends on PATH setup.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 SCHEMA=1
 ONLY=""
 WANT_INSTALL=1
@@ -436,15 +440,25 @@ print(IPRE.sub("[已隐去]", txt))
 # 本机探测时使用，绝不写入 NDJSON。没有骨干 ASN 证据时明确回报“未识别”。
 test_route() {
   ev_progress route 10 "准备回程线路检测"
-  if ! have nexttrace; then
+  local nexttrace_bin=""
+  if have nexttrace; then
+    nexttrace_bin=$(command -v nexttrace)
+  else
     install_pkg nexttrace || true
+    if have nexttrace; then
+      nexttrace_bin=$(command -v nexttrace)
+    fi
   fi
-  if ! have nexttrace; then
-    say "尝试用官方脚本安装 nexttrace"
-    curl -fsSL --max-time 90 nxtrace.org/nt 2>/dev/null | bash >/dev/null 2>&1 || true
+  if [ -z "$nexttrace_bin" ]; then
+    say "尝试在测试临时目录安装官方 NextTrace"
+    curl -fsSL --max-time 90 https://nxtrace.org/nt 2>/dev/null | \
+      bash -s -- --bin-dir "$SCRIPT_DIR" >/dev/null 2>&1 || true
+    if [ -x "$SCRIPT_DIR/nexttrace" ]; then
+      nexttrace_bin="$SCRIPT_DIR/nexttrace"
+    fi
   fi
-  if ! have nexttrace; then
-    ev_error route "nexttrace 装不上，已跳过（不影响其它项）"
+  if [ -z "$nexttrace_bin" ]; then
+    ev_error route "NextTrace 安装失败：软件源或官方安装器不可用，回程线路未检测"
     return
   fi
 
@@ -462,7 +476,7 @@ test_route() {
     ev_progress route $(( 10 + i * 9 )) "TCP 探测 ${city}${nm} 回程"
 
     local out brief
-    out=$(nexttrace --tcp --port 443 --json --no-color --no-rdns -q 3 -m 20 "$ip" 2>/dev/null)
+    out=$("$nexttrace_bin" --tcp --port 443 --json --no-color --no-rdns -q 3 -m 20 "$ip" 2>/dev/null)
     brief=$(printf '%s' "$out" | python3 -c '
 import json, sys
 try:
